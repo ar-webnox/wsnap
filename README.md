@@ -69,6 +69,19 @@ None are required in production. `CHROME_PATH` is optional and local-only.
 - **Workflow:** batch mode (≤5 URLs), multi-size capture (extra Desktop/Tablet/Mobile, ≤10 captures per run, run one after another), saved + recently used configurations, reset, drag-and-drop import of PNG/JPEG/WebP, keyboard shortcuts (see Settings).
 - **Not implemented:** manual scroll-and-stitch capture. Chromium's native full-page capture is used, capped at ~16,000 px / 50 MP and truncation is reported. Stitching would add memory use and seam artifacts on sticky-header sites and was not worth the risk on a 1 GB function.
 
+## Install as an app (PWA)
+
+WSNAP is installable on Android, Windows, macOS, ChromeOS and iOS/iPadOS.
+
+- **Chrome, Edge, Brave, Samsung Internet (Android, Windows, macOS, ChromeOS):** an **Install** button appears in the top bar when the browser offers installation (or use the browser's install icon/menu).
+- **iPhone / iPad:** open WSNAP in Safari, tap Share, then **Add to Home Screen**. The Install button shows these steps.
+- **Safari on macOS 14+:** File, then **Add to Dock**.
+- **Firefox desktop** does not support installing web apps.
+
+What is included: `app/manifest.ts` (served at `/manifest.webmanifest`: name/short name WSNAP, standalone display, `#09090b` colors, icons incl. maskable, shortcuts, screenshots), icons in `public/icons/`, iOS launch images in `public/splash/` (portrait, 14 common iPhone/iPad sizes; other devices fall back to a plain background), `public/sw.js` (offline app shell) and `public/offline.html`.
+
+Offline behaviour: the app shell opens without a connection and saved captures (IndexedDB) stay viewable. Capturing needs the network: `/api/*` is never intercepted or cached. The service worker registers in production builds only. To ship an updated worker cache, bump `VERSION` in `public/sw.js`.
+
 ## Capture accuracy notes
 
 - **Color scheme:** Auto emulates your device's light/dark preference (Playwright alone always reports "light"), Light/Dark force it. It is set on the browser context, so it is active before the page parses. Sites that only offer a manual theme toggle cannot be switched this way and WSNAP says so for Dark mode when no dark theme is detected. No CSS filters are used.

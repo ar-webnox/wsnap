@@ -1,8 +1,10 @@
 "use client";
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { Moon, Settings, Sun, Trash2, X, Monitor } from "lucide-react";
 import { useTheme, type Theme } from "./theme";
 import { Seg, btnGhost } from "./ui";
+import { InstallButton } from "./Pwa";
 
 function Logo() {
   return (
@@ -29,6 +31,7 @@ export function Nav() {
         <nav className="flex items-center gap-1 text-sm">
           <a href="#studio" className="hidden h-10 items-center rounded-lg px-3 text-muted hover:text-fg sm:flex">Studio</a>
           <a href="#recent" className="hidden h-10 items-center rounded-lg px-3 text-muted hover:text-fg sm:flex">Recent</a>
+          <InstallButton />
           <button className="grid size-10 place-items-center rounded-lg text-muted hover:bg-soft hover:text-fg" aria-label="Toggle theme"
             onClick={() => setTheme(document.documentElement.classList.contains("dark") ? "light" : "dark")}>
             <Sun className="hidden size-[18px] dark:block" /><Moon className="size-[18px] dark:hidden" />
@@ -38,7 +41,7 @@ export function Nav() {
           </button>
         </nav>
       </div>
-      {open && (
+      {open && createPortal(
         <div className="fixed inset-0 z-40 grid place-items-end bg-black/50 p-0 sm:place-items-center sm:p-4" onClick={() => setOpen(false)}>
           <div role="dialog" aria-modal="true" aria-label="Settings" onClick={(e) => e.stopPropagation()}
             className="rise w-full max-w-md rounded-t-2xl border border-line bg-panel p-5 shadow-2xl sm:rounded-2xl">
@@ -63,7 +66,8 @@ export function Nav() {
               <Trash2 className="size-4" />Clear history
             </button>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </header>
   );
