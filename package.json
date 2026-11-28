@@ -11,7 +11,10 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "setup:browser": "playwright-core install chromium",
-    "test": "node tests/run.mjs"
+    "test": "node tests/run.mjs",
+    "test:engine": "node tests/engine.mjs",
+    "test:ui": "node tests/ui.mjs",
+    "test:all": "npm test && npm run test:engine && npm run test:ui"
   },
   "dependencies": {
     "@sparticuz/chromium": "^138.0.2",
@@ -27,6 +30,7 @@
     "@types/node": "^22.10.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
+    "esbuild": "^0.25.0",
     "tailwindcss": "^4.1.11",
     "typescript": "^5.8.0"
   }

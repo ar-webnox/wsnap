@@ -1,27 +1,28 @@
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Bookmark, Camera, Globe, Layers, Loader2, Monitor, RotateCcw, Smartphone, Tablet, Upload, X } from "lucide-react";
-import { LIMITS, type CaptureOptions, type Device } from "@/lib/types";
+import { LIMITS, ZOOM_PRESETS, type CaptureOptions, type Device } from "@/lib/types";
+import { EXTRA_SIZES, MAX_URLS, planJobs, sizeKey, type ExtraDevice } from "@/lib/jobs";
 import { PRESETS } from "@/lib/presets";
 import { validateUrl } from "@/lib/validation";
 import { makeThumb } from "@/lib/export";
 import * as store from "@/lib/history";
-import { Field, Seg, Toggle, btnGhost, btnPrimary, inputCls } from "./ui";
+import { Field, Group, Seg, Toggle, btnGhost, btnPrimary, inputCls } from "./ui";
 import { Preview, type Result } from "./Preview";
 import History from "./History";
 
 type Settings = CaptureOptions;
 const DEFAULTS: Settings = {
   url: "", mode: "full", device: "desktop", width: 1440, height: 900, scale: 1, format: "png", quality: 90,
-  waitMs: 1000, waitUntil: "load", userAgent: "", lazyLoad: true, hideCookieBanners: true, transparent: false, fixed: "keep",
+  waitMs: 1000, waitUntil: "load", userAgent: "", lazyLoad: true, hideCookieBanners: true, transparent: false, fixed: "keep", colorScheme: "auto", zoom: 100,
 };
-const EXTRA_SIZES = { desktop: { width: 1440, height: 900 }, tablet: { width: 820, height: 1180 }, mobile: { width: 393, height: 852 } } as const;
-const MAX_URLS = 5, MAX_JOBS = 10;
 const EXAMPLES = ["wikipedia.org", "github.com", "news.ycombinator.com"];
 const host = (u: string) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return u; } };
 const lsGet = <T,>(k: string, d: T): T => { try { return JSON.parse(localStorage.getItem(k) || "") as T; } catch { return d; } };
 const lsSet = (k: string, v: unknown) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
-const describe = (s: Settings) => `${s.width}×${s.height} · ${s.mode === "full" ? "Full page" : "Viewport"} · ${s.format.toUpperCase()}${s.scale > 1 ? ` · ${s.scale}×` : ""}`;
+const SCHEME_LABEL = { auto: "Auto theme", light: "Light", dark: "Dark" } as const;
+const describe = (s: Settings) => [`${s.width}×${s.height}`, s.mode === "full" ? "Full page" : "Viewport", s.format.toUpperCase(),
+  ...(s.zoom !== 100 ? [`${s.zoom}% zoom`] : []), ...(s.scale > 1 ? [`${s.scale}×`] : []), ...(s.colorScheme !== "auto" ? [SCHEME_LABEL[s.colorScheme]] : [])].join(" · ");
 type Saved = { name: string; s: Settings };
 type Err = { code: string; message: string };
 
@@ -54,14 +55,19 @@ async function captureOnce(payload: Settings, signal: AbortSignal) {
   if (!blob.size || !width || !height) throw { code: "UNKNOWN", message: "The server returned an empty image, so nothing was saved." } satisfies Err;
   let notes: string[] = [];
   try { notes = JSON.parse(decodeURIComponent(res.headers.get("X-Notes") || "[]")); } catch {}
-  return { blob, width, height, notes, ms: Number(res.headers.get("X-Capture-Ms")) || null };
+  const dec = (k: string) => { try { return decodeURIComponent(res.headers.get(k) || ""); } catch { return ""; } };
+  const info = { finalUrl: dec("X-Final-Url"), title: dec("X-Page-Title"), status: Number(res.headers.get("X-Http-Status")) || undefined, pageHeight: Number(res.headers.get("X-Page-Height")) || undefined };
+  return { blob, width, height, notes, ms: Number(res.headers.get("X-Capture-Ms")) || null, info };
 }
 
 export default function Studio() {
   const [s, setS] = useState<Settings>(DEFAULTS);
   const [batch, setBatch] = useState(false);
   const [batchText, setBatchText] = useState("");
-  const [extra, setExtra] = useState<Device[]>([]);
+  const [extra, setExtra] = useState<ExtraDevice[]>([]);
+  const [customZoom, setCustomZoom] = useState(false);
+  const [jobStates, setJobStates] = useState<{ label: string; st: "wait" | "run" | "ok" | "fail" }[]>([]);
+  const [failedJobs, setFailedJobs] = useState<Settings[]>([]);
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [error, setError] = useState<Err | null>(null);
   const [failures, setFailures] = useState<string[]>([]);
@@ -77,6 +83,7 @@ export default function Studio() {
   const [presetName, setPresetName] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const runningRef = useRef(false);
+  const startedAt = useRef(0);
   const previewRef = useRef<HTMLElement>(null);
   const urlRef = useRef<HTMLInputElement>(null);
   const runRef = useRef<() => void>(() => {});
@@ -115,57 +122,61 @@ export default function Studio() {
   }, [refresh]);
 
   const showBlob = useCallback((blob: Blob, p: Partial<Result> & Pick<Result, "width" | "height" | "format" | "url" | "title">) => {
-    setResult({ blob, src: URL.createObjectURL(blob), ms: null, notes: [], mode: "full", scale: 1, quality: 90, onRegenerate: null, ...p });
+    setResult({ blob, src: URL.createObjectURL(blob), ms: null, notes: [], mode: "full", scale: 1, zoom: 100, scheme: "auto", quality: 90, onRegenerate: null, ...p });
     setStatus("done");
   }, []);
 
-  const run: (single?: Settings) => Promise<void> = useCallback(async (single?: Settings) => {
+  const run: (single?: Settings, retryJobs?: Settings[]) => Promise<void> = useCallback(async (single?: Settings, retryJobs?: Settings[]) => {
     if (runningRef.current) return;
     const cfg = single ?? s;
-    const raw = single || !batch ? [cfg.url] : batchText.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
-    const urls: string[] = [], bad: string[] = [];
-    for (const r of Array.from(new Set(raw))) { const v = validateUrl(r); v.ok ? urls.push(v.url.href) : bad.push(`${r.slice(0, 60)}: ${v.message}`); }
-    if (!urls.length) { setError({ code: "INVALID_URL", message: bad[0]?.replace(/^.*?: /, "") || "Enter a website address to capture." }); setStatus("error"); return; }
-    if (urls.length > MAX_URLS) { setError({ code: "INVALID_URL", message: `Batch mode accepts up to ${MAX_URLS} URLs at a time.` }); setStatus("error"); return; }
-    const sizes = [{ device: cfg.device, width: cfg.width, height: cfg.height }, ...(single ? [] : extra.filter((d) => d !== cfg.device).map((d) => ({ device: d, ...EXTRA_SIZES[d as keyof typeof EXTRA_SIZES] })))];
-    const jobs = urls.flatMap((u) => sizes.map((z) => ({ ...cfg, ...z, url: u,
-      width: Math.min(LIMITS.maxW, Math.max(LIMITS.minW, z.width || 0)), height: Math.min(LIMITS.maxH, Math.max(LIMITS.minH, z.height || 0)) })));
-    if (jobs.length > MAX_JOBS) { setError({ code: "INVALID_URL", message: `That would create ${jobs.length} captures; the limit is ${MAX_JOBS} per run. Remove some URLs or sizes.` }); setStatus("error"); return; }
+    const plan = planJobs(cfg, single || !batch ? [cfg.url] : batchText.split(/\r?\n/), single ? [] : extra);
+    if (!retryJobs) {
+      if (!plan.jobs.length) { setError({ code: "INVALID_URL", message: plan.invalid[0]?.replace(/^.*?: /, "") || "Enter a website address to capture." }); setStatus("error"); return; }
+      if (plan.tooMany) { setError({ code: "INVALID_URL", message: plan.tooMany }); setStatus("error"); return; }
+    }
+    const sys = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    const bad = retryJobs ? [] : plan.invalid;
+    const jobs = (retryJobs ?? plan.jobs).map((j) => ({ ...j, systemScheme: sys as "dark" | "light" }));
 
-    runningRef.current = true;
+    runningRef.current = true; startedAt.current = Date.now();
     const ac = new AbortController(); abortRef.current = ac;
     setStatus("loading"); setError(null); setFailures(bad); setElapsed(0);
-    if (!single) { const r = [{ name: describe(cfg), s: { ...cfg, url: "" } }, ...recent.filter((x) => x.name !== describe(cfg))].slice(0, 5); setRecent(r); lsSet("wsnap:recent", r); }
+    if (!single && !retryJobs) { const r = [{ name: describe(cfg), s: { ...cfg, url: "" } }, ...recent.filter((x) => x.name !== describe(cfg))].slice(0, 5); setRecent(r); lsSet("wsnap:recent", r); }
     if (innerWidth < 1024) previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    let ok = 0; const fails = [...bad];
+    let ok = 0; const fails = [...bad]; const failedList: Settings[] = [];
+    const lab = (j: Settings) => `${host(j.url)} · ${j.width}×${j.height}`;
+    const mark = (i: number, st: "wait" | "run" | "ok" | "fail") => setJobStates((a) => a.map((x, k) => (k === i ? { ...x, st } : x)));
+    setJobStates(jobs.map((j) => ({ label: lab(j), st: "wait" }))); setFailedJobs([]);
     for (let i = 0; i < jobs.length; i++) {
       const j = jobs[i];
-      setProgress({ i: i + 1, n: jobs.length, label: `${host(j.url)} · ${j.width}×${j.height}` });
+      setProgress({ i: i + 1, n: jobs.length, label: lab(j) }); mark(i, "run");
       try {
         const r = await captureOne(j, ac.signal);
         ok++;
-        showBlob(r.blob, { width: r.width, height: r.height, format: j.format, url: j.url, title: host(j.url), mode: j.mode, scale: j.scale, quality: j.quality, notes: r.notes, ms: r.ms, onRegenerate: () => run(j) });
+        showBlob(r.blob, { width: r.width, height: r.height, format: j.format, url: j.url, title: host(j.url), mode: j.mode, scale: j.scale, quality: j.quality, notes: r.notes, ms: r.ms, info: r.info, zoom: j.zoom, scheme: j.colorScheme, onRegenerate: () => run(j) });
+        mark(i, "ok");
         setStatus("loading");
         await persist(r.blob, { name: `${host(j.url)} · ${r.width}×${r.height}`, url: j.url, width: r.width, height: r.height, format: j.format, settings: j });
       } catch (e) {
         if ((e as Error)?.name === "AbortError") break;
-        const k = e as Partial<Err>;
+        const k = e as Partial<Err>; mark(i, "fail"); failedList.push(j);
         fails.push(`${host(j.url)} (${j.width}×${j.height}): ${k.message && k.code ? k.message : "Couldn't reach the WSNAP server."}`);
         if (jobs.length === 1) setError(k.message && k.code ? (k as Err) : { code: "NETWORK", message: "Couldn't reach the WSNAP server. Check your connection and try again." });
       }
     }
-    runningRef.current = false; abortRef.current = null; setProgress(null); setFailures(fails);
+    runningRef.current = false; abortRef.current = null; setProgress(null); setFailures(fails); setFailedJobs(failedList);
     setStatus(ok > 0 ? "done" : ac.signal.aborted ? "idle" : "error");
     if (!ok && !ac.signal.aborted && jobs.length > 1) setError({ code: "UNKNOWN", message: "None of the captures succeeded. See the details below." });
   }, [s, batch, batchText, extra, recent, persist, showBlob]);
+  // Re-run only what failed, with the exact settings each job had.
   runRef.current = () => run();
 
   const open = useCallback(async (e: store.Entry) => {
     const blob = await store.getBlob(e.id);
     if (!blob) { reportError("That capture is no longer stored in this browser."); return; }
     const cfg = e.settings;
-    showBlob(blob, { width: e.width, height: e.height, format: e.format, url: e.url, title: e.name, mode: cfg?.mode ?? "full", scale: cfg?.scale ?? 1, quality: cfg?.quality ?? 90, onRegenerate: cfg ? () => run(cfg) : null });
-    if (cfg) setS({ ...cfg, userAgent: cfg.userAgent ?? "" });
+    showBlob(blob, { width: e.width, height: e.height, format: e.format, url: e.url, title: e.name, mode: cfg?.mode ?? "full", scale: cfg?.scale ?? 1, zoom: cfg?.zoom ?? 100, scheme: cfg?.colorScheme ?? "auto", quality: cfg?.quality ?? 90, onRegenerate: cfg ? () => run(cfg) : null });
+    if (cfg) { setS({ ...DEFAULTS, ...cfg, userAgent: cfg.userAgent ?? "" }); setCustomZoom(false); }
     previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [run, showBlob, reportError]);
 
@@ -204,9 +215,14 @@ export default function Studio() {
   const pickDevice = (d: Device) => d === "custom" ? set("device", "custom") : setS((x) => ({ ...x, device: d, width: PRESETS[d][0].w, height: PRESETS[d][0].h }));
   const loading = status === "loading";
   const presets = s.device === "custom" ? [] : PRESETS[s.device];
-  const nUrls = batch ? batchText.split(/\r?\n/).filter((x) => x.trim()).length : 1;
-  const nJobs = nUrls * (1 + extra.filter((d) => d !== s.device).length);
-  const applyCfg = (c: Settings) => { setS({ ...DEFAULTS, ...c, url: s.url }); setMenu(false); };
+  const plan = useMemo(() => planJobs(s, batch ? batchText.split(/\r?\n/) : [s.url], extra), [s, batch, batchText, extra]);
+  const nJobs = plan.count;
+  const primaryKey = sizeKey(s);
+  const isCustomZoom = customZoom || !(ZOOM_PRESETS as readonly number[]).includes(s.zoom);
+  const full = s.mode === "full";
+  const extraActive = extra.filter((d) => sizeKey({ ...EXTRA_SIZES[d], device: d }) !== primaryKey);
+  const changed = [s.scale !== 1, s.zoom !== 100, s.colorScheme !== "auto", s.waitUntil !== "load", s.waitMs !== 1000, !!s.userAgent?.trim(), s.fixed !== "keep", !s.lazyLoad, !s.hideCookieBanners, s.transparent].filter(Boolean).length;
+  const applyCfg = (c: Settings) => { setS({ ...DEFAULTS, ...c, url: s.url }); setCustomZoom(false); setMenu(false); };
   const savePreset = () => {
     const name = presetName.trim().slice(0, 40); if (!name) return;
     const n = [{ name, s: { ...s, url: "" } }, ...saved.filter((p) => p.name !== name)].slice(0, 12);
@@ -233,12 +249,15 @@ export default function Studio() {
           </>)}
         </div>
         {loading
-          ? <button type="button" className={`${btnPrimary} h-12 sm:w-52`} onClick={() => abortRef.current?.abort()}><X className="size-4" />Cancel</button>
-          : <button type="submit" className={`${btnPrimary} h-12 sm:w-52`} title="Ctrl/⌘ + Enter"><Camera className="size-4" />{nJobs > 1 ? `Generate ${nJobs} screenshots` : "Generate screenshot"}</button>}
+          ? <button type="button" className={`${btnPrimary} h-12 shrink-0 whitespace-nowrap sm:min-w-56`} onClick={() => { if (Date.now() - startedAt.current > 700) abortRef.current?.abort(); }} title="Cancel this capture"><X className="size-4" />Cancel</button>
+          : <button type="submit" className={`${btnPrimary} h-12 shrink-0 whitespace-nowrap sm:min-w-56`} title="Ctrl/⌘ + Enter"><Camera className="size-4" />{`Generate ${nJobs} screenshot${nJobs > 1 ? "s" : ""}`}</button>}
       </form>
       <button type="button" className="mt-2 inline-flex h-9 items-center gap-1.5 rounded-lg px-1 text-[13px] text-muted hover:text-fg" aria-pressed={batch} onClick={() => setBatch((b) => !b)}>
         <Layers className="size-3.5" />{batch ? "Back to single URL" : "Batch mode: capture several URLs"}
       </button>
+      <p className={`mt-1 text-xs ${plan.tooMany ? "text-red-500" : "text-muted"}`} aria-live="polite" data-testid="summary">
+        {plan.tooMany ?? <>{nJobs} screenshot{nJobs > 1 ? "s" : ""} · {describe(s)}{extraActive.length > 0 && <> · + {extraActive.join(", ")} size{extraActive.length > 1 ? "s" : ""}</>}</>}
+      </p>
 
       <div className="mt-4 grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
         <section aria-label="Capture settings" className="h-fit space-y-5 rounded-xl border border-line bg-panel p-5">
@@ -246,7 +265,7 @@ export default function Studio() {
             <h2 className="text-sm font-semibold">Capture settings</h2>
             <div className="flex gap-1">
               <button type="button" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-muted hover:bg-soft hover:text-fg" aria-expanded={menu} onClick={() => setMenu((m) => !m)} title="Saved and recent configurations"><Bookmark className="size-3.5" />Presets</button>
-              <button type="button" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-muted hover:bg-soft hover:text-fg" onClick={() => { setS({ ...DEFAULTS, url: s.url }); setExtra([]); }} title="Reset all settings to defaults"><RotateCcw className="size-3.5" />Reset</button>
+              <button type="button" className="inline-flex h-9 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-muted hover:bg-soft hover:text-fg" onClick={() => { setS({ ...DEFAULTS, url: s.url }); setExtra([]); setCustomZoom(false); }} title="Reset all settings to defaults"><RotateCcw className="size-3.5" />Reset</button>
             </div>
             {menu && (
               <div className="rise absolute right-0 top-10 z-20 w-72 max-w-[calc(100vw-3rem)] rounded-xl border border-line bg-panel p-3 shadow-xl">
@@ -291,15 +310,19 @@ export default function Studio() {
             <Field label="Height" hint="px"><input className={inputCls} type="number" inputMode="numeric" min={LIMITS.minH} max={LIMITS.maxH} value={s.height || ""} onChange={(e) => setS((x) => ({ ...x, height: Number(e.target.value), device: "custom" }))} /></Field>
           </div>
           <div>
-            <p className="mb-1.5 text-[13px] font-medium">Also capture at <span className="font-normal text-muted">(optional)</span></p>
+            <p className="mb-1.5 flex items-baseline justify-between text-[13px] font-medium">Additional sizes<span className="font-normal text-muted">{extraActive.length ? `+${extraActive.length} per URL` : "none"}</span></p>
             <div className="flex flex-wrap gap-2">
-              {(Object.keys(EXTRA_SIZES) as (keyof typeof EXTRA_SIZES)[]).map((d) => {
-                const on = extra.includes(d) && s.device !== d;
-                return <button key={d} type="button" aria-pressed={on} disabled={s.device === d} title={`${EXTRA_SIZES[d].width} × ${EXTRA_SIZES[d].height}`}
+              {(Object.keys(EXTRA_SIZES) as ExtraDevice[]).map((d) => {
+                const z = EXTRA_SIZES[d];
+                const same = sizeKey({ ...z, device: d }) === primaryKey;
+                const on = extra.includes(d) && !same;
+                return <button key={d} type="button" aria-pressed={on} disabled={same}
+                  title={same ? "Same as your main capture size" : `${on ? "Remove the extra" : "Add an extra"} ${d} capture at ${z.width} × ${z.height}`}
                   onClick={() => setExtra((x) => (x.includes(d) ? x.filter((y) => y !== d) : [...x, d]))}
-                  className={`h-10 rounded-full border px-3.5 text-[13px] capitalize transition disabled:opacity-40 ${on ? "border-accent bg-accent/10" : "border-line hover:bg-soft"}`}>{d}</button>;
+                  className={`h-10 rounded-full border px-3.5 text-[13px] capitalize transition disabled:opacity-40 ${on ? "border-accent bg-accent/10" : "border-line hover:bg-soft"}`}>{d}<span className="ml-1.5 text-xs normal-case text-muted">{z.width}×{z.height}</span></button>;
               })}
             </div>
+            <p className="mt-1.5 text-xs text-muted">Each selected size adds one more screenshot per URL.</p>
           </div>
           <div>
             <p className="mb-1.5 text-[13px] font-medium">Format</p>
@@ -309,24 +332,48 @@ export default function Studio() {
             <input type="range" min={40} max={100} value={s.quality} disabled={s.format === "png"} onChange={(e) => set("quality", Number(e.target.value))} className="h-11 w-full accent-[var(--accent)] disabled:opacity-40" />
           </Field>
           <details className="group rounded-lg border border-line">
-            <summary className="flex h-11 cursor-pointer list-none items-center justify-between px-3 text-[13px] font-medium">Advanced options<span className="text-muted transition group-open:rotate-45">+</span></summary>
-            <div className="space-y-4 border-t border-line p-3">
-              <div>
-                <p className="mb-1.5 text-[13px] font-medium">Device scale factor</p>
-                <Seg<number> label="Scale factor" value={s.scale} onChange={(v) => set("scale", v)} options={[{ v: 1, label: "1×" }, { v: 2, label: "2×" }, { v: 3, label: "3×" }]} />
-                <p className="mt-1.5 text-xs text-muted">Zoom stays at 100%. Higher factors render more pixels (sharper, larger files).</p>
-              </div>
-              <Field label="Wait for"><select className={inputCls} value={s.waitUntil} onChange={(e) => set("waitUntil", e.target.value as Settings["waitUntil"])}>
-                <option value="domcontentloaded">DOM ready (fastest)</option><option value="load">Page loaded</option><option value="networkidle">Network idle (most complete)</option></select></Field>
-              <Field label="Extra delay" hint={`${(s.waitMs / 1000).toFixed(1)}s`}><input type="range" min={0} max={LIMITS.maxWaitMs} step={500} value={s.waitMs} onChange={(e) => set("waitMs", Number(e.target.value))} className="h-11 w-full accent-[var(--accent)]" /></Field>
-              <Field label="Sticky & fixed elements" hint="full page"><select className={inputCls} value={s.fixed} onChange={(e) => set("fixed", e.target.value as Settings["fixed"])}>
-                <option value="keep">Keep as rendered</option><option value="static">Pin to page position</option><option value="hide">Hide them</option></select></Field>
-              <Field label="Custom user-agent" hint="optional"><input className={inputCls} value={s.userAgent ?? ""} maxLength={300} placeholder="Default for the selected device" onChange={(e) => set("userAgent", e.target.value)} /></Field>
-              <div className="divide-y divide-line">
-                <Toggle checked={s.lazyLoad} onChange={(v) => set("lazyLoad", v)} label="Load lazy content" hint="Scrolls the page and waits for images (full page only)" />
-                <Toggle checked={s.hideCookieBanners} onChange={(v) => set("hideCookieBanners", v)} label="Hide cookie banners" hint="Best effort" />
-                <Toggle checked={s.transparent} onChange={(v) => set("transparent", v)} label="Transparent background" hint="Only where the page has no background color" />
-              </div>
+            <summary className="flex h-11 cursor-pointer list-none items-center justify-between px-3 text-[13px] font-medium"><span>Advanced options{changed > 0 && <span className="ml-2 rounded-full bg-accent/15 px-2 py-0.5 text-[11px] font-medium text-accent">{changed} changed</span>}</span><span className="text-muted transition group-open:rotate-45">+</span></summary>
+            <div className="space-y-5 border-t border-line p-3">
+              <Group title="Rendering">
+                <div>
+                  <p className="mb-1.5 text-[13px] font-medium">Device scale factor</p>
+                  <Seg<number> label="Scale factor" value={s.scale} onChange={(v) => set("scale", v)} options={[{ v: 1, label: "1×" }, { v: 2, label: "2×" }, { v: 3, label: "3×" }]} />
+                  <p className="mt-1.5 text-xs text-muted">Pixel density only: sharper output, larger files. Layout is unchanged.</p>
+                </div>
+                <Field label="Browser zoom" hint={`${s.zoom}%`} title="Zooms like Ctrl +/− in a browser: the page lays out at width ÷ zoom CSS pixels. Viewport size and scale factor stay separate.">
+                  <select className={inputCls} value={isCustomZoom ? "custom" : String(s.zoom)} onChange={(e) => { if (e.target.value === "custom") setCustomZoom(true); else { setCustomZoom(false); set("zoom", Number(e.target.value)); } }}>
+                    {ZOOM_PRESETS.map((z) => <option key={z} value={z}>{z}%{z === 100 ? " (default)" : ""}</option>)}
+                    <option value="custom">Custom…</option>
+                  </select>
+                  {isCustomZoom && <input className={`${inputCls} mt-2`} type="number" inputMode="numeric" min={LIMITS.minZoom} max={LIMITS.maxZoom} aria-label="Custom zoom percentage" aria-invalid={s.zoom < LIMITS.minZoom || s.zoom > LIMITS.maxZoom} placeholder={`${LIMITS.minZoom}–${LIMITS.maxZoom} %`} value={s.zoom || ""} onChange={(e) => set("zoom", Number(e.target.value))} />}
+                </Field>
+                <p className="-mt-1.5 text-xs text-muted">Browser-style zoom (emulated with the CSS viewport and pixel ratio, as Chromium does), so responsive layouts react as they would in a browser. Output stays {s.width * s.scale} px wide.</p>
+                <div>
+                  <p className="mb-1.5 text-[13px] font-medium">Website color scheme</p>
+                  <Seg<Settings["colorScheme"]> label="Color scheme" value={s.colorScheme} onChange={(v) => set("colorScheme", v)} options={[{ v: "auto", label: "Auto" }, { v: "light", label: "Light" }, { v: "dark", label: "Dark" }]} />
+                  <p className="mt-1.5 text-xs text-muted">{({ auto: "Matches your device's light/dark setting, like visiting the site yourself. Sites with a fixed theme keep it.", light: "Asks the site for its light theme (prefers-color-scheme: light).", dark: "Asks the site for its dark theme (prefers-color-scheme: dark). Sites without a dark theme stay light." })[s.colorScheme]}</p>
+                </div>
+                <Field label="Custom user-agent" hint="optional"><input className={inputCls} value={s.userAgent ?? ""} maxLength={300} placeholder="Default for the selected device" onChange={(e) => set("userAgent", e.target.value)} /></Field>
+              </Group>
+              <Group title="Loading">
+                <Field label="Page load strategy"><select className={inputCls} value={s.waitUntil} onChange={(e) => set("waitUntil", e.target.value as Settings["waitUntil"])}>
+                  <option value="domcontentloaded">DOM ready (fastest)</option><option value="load">Page loaded</option><option value="networkidle">Network idle (most complete)</option></select></Field>
+                <Field label="Wait before capture" hint={s.waitMs === 0 ? "none" : `${(s.waitMs / 1000).toFixed(1)}s`}><input type="range" min={0} max={LIMITS.maxWaitMs} step={500} value={s.waitMs} onChange={(e) => set("waitMs", Number(e.target.value))} className="h-11 w-full accent-[var(--accent)]" /></Field>
+                <div className="divide-y divide-line">
+                  <Toggle checked={s.lazyLoad} onChange={(v) => set("lazyLoad", v)} disabled={!full} label="Load lazy content" hint="Scrolls the page and waits for images"
+                    title={full ? undefined : "Only applies to Full page captures. Viewport captures show just the top of the page, which is already loaded."} />
+                </div>
+              </Group>
+              <Group title="Page">
+                <Field label="Sticky & fixed elements" title={full ? undefined : "Only applies to Full page captures. In Viewport mode fixed elements appear exactly where a visitor would see them."}>
+                  <select className={inputCls} disabled={!full} value={s.fixed} onChange={(e) => set("fixed", e.target.value as Settings["fixed"])}>
+                    <option value="keep">Keep as rendered</option><option value="static">Pin to page position</option><option value="hide">Hide them</option></select></Field>
+                <div className="divide-y divide-line">
+                  <Toggle checked={s.hideCookieBanners} onChange={(v) => set("hideCookieBanners", v)} label="Hide cookie banners" hint="Best effort" />
+                  <Toggle checked={s.transparent} onChange={(v) => set("transparent", v)} disabled={s.format === "jpeg"} label="Transparent background" hint="Only where the page has no background color"
+                    title={s.format === "jpeg" ? "JPEG can't store transparency. Choose PNG or WebP." : undefined} />
+                </div>
+              </Group>
             </div>
           </details>
         </section>
@@ -340,6 +387,7 @@ export default function Studio() {
                 <p className="mt-4 text-sm font-medium">{progress && progress.n > 1 ? `Capturing ${progress.i} of ${progress.n}` : "Capturing"}</p>
                 <p className="mt-1 truncate text-xs text-muted">{progress?.label}</p>
                 <p className="mt-1 text-xs text-muted">{elapsed}s elapsed · most pages finish in 5–20s</p>
+                {jobStates.length > 1 && <ul className="mt-4 space-y-1.5 text-left text-xs">{jobStates.map((j, i) => <li key={i} className="flex items-center gap-2"><span aria-hidden className={`size-1.5 shrink-0 rounded-full ${j.st === "ok" ? "bg-emerald-500" : j.st === "fail" ? "bg-red-500" : j.st === "run" ? "bg-accent" : "bg-line"}`} /><span className={`truncate ${j.st === "wait" ? "text-muted" : ""}`}>{j.label}</span><span className="sr-only">{j.st}</span></li>)}</ul>}
                 <div className="mt-5 h-1 overflow-hidden rounded-full bg-soft"><div className="sweep h-full w-1/4 rounded-full bg-accent" /></div>
               </div></div>
             ) : status === "error" && error ? (
@@ -348,7 +396,7 @@ export default function Studio() {
                 <p className="mt-4 text-sm font-medium">No screenshot was captured</p>
                 <p className="mt-1.5 text-sm leading-relaxed text-muted">{error.message}</p>
                 {failures.length > 1 && <ul className="mt-3 space-y-1 text-left text-xs text-muted">{failures.map((f) => <li key={f}>{f}</li>)}</ul>}
-                {!["INVALID_URL", "BLOCKED"].includes(error.code) && (s.url || batchText) && <button className={`${btnGhost} mt-5`} onClick={() => run()}>Try again</button>}
+                {!["INVALID_URL", "BLOCKED"].includes(error.code) && (s.url || batchText) && <button className={`${btnGhost} mt-5`} onClick={() => (failedJobs.length ? run(undefined, failedJobs) : run())}>{failedJobs.length > 1 ? `Retry failed (${failedJobs.length})` : "Try again"}</button>}
               </div></div>
             ) : (
               <div className="grid min-h-[22rem] place-items-center p-8 text-center"><div className="max-w-sm">
@@ -360,7 +408,7 @@ export default function Studio() {
             )}
           </div>
           {status === "done" && failures.length > 0 && (
-            <div role="status" className="mt-3 rounded-lg bg-amber-500/10 px-3 py-2 text-[13px]"><p className="font-medium">Some captures didn't complete</p><ul className="mt-1 space-y-0.5 text-xs">{failures.map((f) => <li key={f}>{f}</li>)}</ul></div>
+            <div role="status" className="mt-3 rounded-lg bg-amber-500/10 px-3 py-2 text-[13px]"><p className="font-medium">Some captures didn't complete</p><ul className="mt-1 space-y-0.5 text-xs">{failures.map((f) => <li key={f}>{f}</li>)}</ul>{failedJobs.length > 0 && !loading && <button className={`${btnGhost} mt-2`} onClick={() => run(undefined, failedJobs)}>Retry failed ({failedJobs.length})</button>}</div>
           )}
         </section>
       </div>

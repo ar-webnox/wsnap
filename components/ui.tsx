@@ -8,9 +8,9 @@ export const btnPrimary =
 export const btnGhost =
   "inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-line bg-panel px-3.5 text-sm font-medium text-fg transition hover:bg-soft active:scale-[.98] disabled:cursor-not-allowed disabled:opacity-50";
 
-export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function Field({ label, hint, title, children }: { label: string; hint?: string; title?: string; children: ReactNode }) {
   return (
-    <label className="block">
+    <label className="block" title={title}>
       <span className="mb-1.5 flex items-baseline justify-between text-[13px] font-medium">{label}{hint && <span className="font-normal text-muted">{hint}</span>}</span>
       {children}
     </label>
@@ -33,14 +33,23 @@ export function Seg<T extends string | number>({ value, onChange, options, label
   );
 }
 
-export function Toggle({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string }) {
+export function Toggle({ checked, onChange, label, hint, disabled, title }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string; disabled?: boolean; title?: string }) {
   return (
-    <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)}
-      className="flex min-h-11 w-full items-center justify-between gap-4 text-left">
+    <button type="button" role="switch" aria-checked={checked} aria-disabled={disabled} disabled={disabled} title={title} onClick={() => onChange(!checked)}
+      className="flex min-h-11 w-full items-center justify-between gap-4 text-left disabled:cursor-not-allowed disabled:opacity-50">
       <span><span className="block text-[13px] font-medium">{label}</span>{hint && <span className="block text-xs text-muted">{hint}</span>}</span>
       <span className={`relative h-6 w-10 shrink-0 rounded-full transition ${checked ? "bg-accent" : "bg-line"}`}>
         <span className={`absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow transition-transform ${checked ? "translate-x-4" : ""}`} />
       </span>
     </button>
+  );
+}
+
+export function Group({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="space-y-3.5">
+      <p className="text-[11px] font-semibold uppercase tracking-wider text-muted">{title}</p>
+      {children}
+    </div>
   );
 }

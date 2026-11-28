@@ -7,7 +7,8 @@ import { btnGhost, btnPrimary } from "./ui";
 
 export interface Result {
   blob: Blob; src: string; width: number; height: number; format: ImageFormat; ms: number | null;
-  notes: string[]; url: string; title: string; mode: "full" | "viewport"; scale: number; quality: number; onRegenerate: (() => void) | null;
+  notes: string[]; url: string; title: string; mode: "full" | "viewport"; scale: number; zoom: number; scheme: "auto" | "light" | "dark"; quality: number; onRegenerate: (() => void) | null;
+  info?: { finalUrl?: string; title?: string; status?: number; pageHeight?: number };
 }
 const STEPS = [10, 25, 50, 75, 100, 150, 200, 300, 400];
 const ico = "grid size-10 place-items-center rounded-lg border border-line bg-panel text-muted transition hover:bg-soft hover:text-fg disabled:opacity-40";
@@ -81,7 +82,7 @@ function PreviewImpl({ r, onError }: { r: Result; onError: (m: string) => void }
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line p-3 sm:px-4">
         <div className="min-w-0 text-[13px]">
           <p className="truncate font-medium" title={r.title}>{r.title}</p>
-          <p className="text-muted">{r.width} × {r.height}px{r.scale > 1 ? ` (${r.scale}×)` : ""} · {formatBytes(r.blob.size)} · {label}{r.ms ? ` · ${(r.ms / 1000).toFixed(1)}s` : ""}</p>
+          <p className="text-muted">{r.width} × {r.height}px · {formatBytes(r.blob.size)} · {label}{r.ms ? ` · ${(r.ms / 1000).toFixed(1)}s` : ""}</p>
         </div>
         <div className="flex items-center gap-1.5" role="toolbar" aria-label="Zoom">
           <button className={ico} onClick={() => step(-1)} title="Zoom out (−)" aria-label="Zoom out"><ZoomOut className="size-4" /></button>
@@ -97,8 +98,19 @@ function PreviewImpl({ r, onError }: { r: Result; onError: (m: string) => void }
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={r.src} alt={`Screenshot of ${r.title}`} width={r.width} height={r.height} decoding="async"
           className="mx-auto block h-auto max-w-none rounded-sm bg-white shadow-lg ring-1 ring-line"
-          style={zoom === "fit" ? { width: "100%", maxWidth: r.width } : { width: (r.width * zoom) / 100 }} />
+          style={zoom === "fit" ? { width: "100%", maxWidth: r.width } : { width: (r.width * zoom) / 100, imageRendering: zoom > 100 ? "pixelated" : "auto" }} />
       </div>
+      <details className="group border-t border-line text-[13px]">
+        <summary className="flex h-11 cursor-pointer list-none items-center justify-between px-3 font-medium sm:px-4">Capture details<span className="text-muted transition group-open:rotate-45">+</span></summary>
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 px-3 pb-3 sm:px-4">
+          {([
+            r.info?.finalUrl && ["Captured URL", r.info.finalUrl], r.info?.title && ["Page title", r.info.title],
+            r.info?.status && ["HTTP status", String(r.info.status)], r.info?.pageHeight && ["Page height", `${r.info.pageHeight.toLocaleString()} CSS px`],
+            ["Mode", r.mode === "full" ? "Full page" : "Viewport"], ["Image size", `${r.width} × ${r.height} px`],
+            ["Device scale", `${r.scale}×`], ["Browser zoom", `${r.zoom}%`], ["Color scheme", { auto: "Auto (matches device)", light: "Light", dark: "Dark" }[r.scheme]],
+          ].filter(Boolean) as [string, string][]).map(([k, v]) => <div key={k} className="contents"><dt className="text-muted">{k}</dt><dd className="break-words">{v}</dd></div>)}
+        </dl>
+      </details>
       {r.notes.length > 0 && <ul className="space-y-1 border-t border-line bg-amber-500/10 px-4 py-3 text-[13px]">{r.notes.map((n) => <li key={n}>{n}</li>)}</ul>}
       <div className="flex flex-wrap gap-2 border-t border-line p-3 sm:px-4">
         <button className={`${btnPrimary} h-10`} onClick={() => save(r.blob, r.format)} title="Download the original file (D)"><Download className="size-4" />Download {label}</button>

@@ -46,6 +46,10 @@ export async function POST(req: Request) {
         "X-Image-Height": String(r.height),
         "X-Capture-Ms": String(r.ms),
         "X-Notes": encodeURIComponent(JSON.stringify(r.notes)),
+        "X-Final-Url": encodeURIComponent(r.finalUrl.slice(0, 2048)),
+        "X-Page-Title": encodeURIComponent(r.title),
+        "X-Http-Status": String(r.status),
+        "X-Page-Height": String(r.pageHeight ?? ""),
       },
     });
   } catch (e) {

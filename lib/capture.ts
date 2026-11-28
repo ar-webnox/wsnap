@@ -1,6 +1,7 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import sharp from "sharp";
 import { assertPublicHost, BlockedHostError } from "./ssrf";
+import { zoomGeometry } from "./geometry";
 import { LIMITS, type CaptureOptions, type ErrorCode, type ImageFormat } from "./types";
 
 export class CaptureError extends Error {
@@ -49,7 +50,8 @@ async function getBrowser(): Promise<Browser> {
   p.then((b) => b.on("disconnected", () => { if (shared === p) shared = null; })).catch(() => { if (shared === p) shared = null; });
   return p;
 }
-async function discardBrowser() {
+/** Closes the warm shared browser (used after crashes and by tests for a clean exit). */
+export async function discardBrowser() {
   const p = shared; shared = null;
   try { await (await p)?.close(); } catch {}
 }
@@ -61,6 +63,7 @@ function mapError(e: unknown): CaptureError {
   if (/ERR_CERT|ERR_SSL|SSL_/.test(m)) return new CaptureError("TLS", "The site's security certificate is invalid, so it can't be captured safely.", 422);
   if (/ERR_BLOCKED_BY_CLIENT/.test(m)) return new CaptureError("BLOCKED", "This address points to a private or restricted network and can't be captured.", 400);
   if (/ERR_CONNECTION|ERR_ADDRESS|ERR_NETWORK|ERR_EMPTY|ERR_TOO_MANY_REDIRECTS|ERR_INTERNET/.test(m)) return new CaptureError("UNREACHABLE", "The website couldn't be reached. It may be offline or may block automated visitors.", 422);
+  if (/Download is starting/i.test(m)) return new CaptureError("UNSUPPORTED", "This address serves a file download rather than a web page, so it can't be captured as a screenshot.", 422);
   if (/Timeout|timed out/i.test(m)) return new CaptureError("TIMEOUT", "The page took too long to load. Try 'DOM ready' wait mode, a smaller viewport or turn off full-page capture.", 504);
   if (/out of memory|Target (page, context or browser has been )?closed|crash|Protocol error|Cannot take screenshot/i.test(m)) return new CaptureError("MEMORY", "The page was too large or heavy to capture. Try viewport mode, a lower scale factor or a smaller width.", 413);
   return new CaptureError("UNKNOWN", "The screenshot couldn't be completed. Please try again.", 500);
@@ -145,9 +148,15 @@ export async function capture(o: CaptureOptions, signal?: AbortSignal) {
     const mobile = o.device === "mobile" || o.device === "tablet";
     const onAbort = () => { ctx?.close().catch(() => {}); };
     signal?.addEventListener("abort", onAbort, { once: true });
+    // Browser zoom, viewport size and device scale factor are three independent inputs (see lib/geometry.ts).
+    const { vw, vh, eff } = zoomGeometry(o.width, o.height, o.scale, o.zoom);
+    // Colour scheme is set on the context, so it is in effect before the first byte of the page is parsed.
+    // "auto" emulates the visitor's own preference (Playwright would otherwise always report "light").
+    const scheme = o.colorScheme === "auto" ? (o.systemScheme ?? "no-preference") : o.colorScheme;
     ctx = await browser.newContext({
-      viewport: { width: o.width, height: o.height },
-      deviceScaleFactor: o.scale,
+      viewport: { width: vw, height: vh },
+      deviceScaleFactor: eff,
+      colorScheme: scheme,
       isMobile: mobile, hasTouch: mobile,
       userAgent: o.userAgent || UA[o.device === "custom" ? "desktop" : o.device],
       serviceWorkers: "block", acceptDownloads: false, locale: "en-US",
@@ -187,7 +196,11 @@ export async function capture(o: CaptureOptions, signal?: AbortSignal) {
     if (status === 403 || status === 429 || status === 503) {
       throw new CaptureError("CHALLENGE", `The site refused the request (HTTP ${status}). It may use bot protection or a CAPTCHA or require authentication.`, 422);
     }
+    if (status === 404 || status === 410) throw new CaptureError("HTTP", `The page wasn't found (HTTP ${status}). Check the address for typos.`, 422);
+    if (status >= 500) throw new CaptureError("HTTP", `The website's server reported an error (HTTP ${status}), so no screenshot was taken. Try again later.`, 422);
     if (status >= 400) throw new CaptureError("HTTP", `The website responded with an error (HTTP ${status}), so no screenshot was taken.`, 422);
+    const ctype = resp?.headers()["content-type"] ?? "";
+    if (/application\/(pdf|zip|octet-stream)|video\/|audio\//i.test(ctype)) throw new CaptureError("UNSUPPORTED", "This address is a document or media file, not a web page. WSNAP captures rendered web pages only.", 422);
 
     if (o.waitUntil === "networkidle") await page.waitForLoadState("networkidle", { timeout: Math.min(8000, Math.max(1000, left() - 20_000)) }).catch(() => notes.push("The page never became fully idle; captured after the wait limit."));
     if (o.hideCookieBanners) await dismissCookies(page);
@@ -205,23 +218,45 @@ export async function capture(o: CaptureOptions, signal?: AbortSignal) {
     }).catch(() => false);
     if (wall) throw new CaptureError("CHALLENGE", "The site is showing a CAPTCHA or bot-protection page instead of its content, so no screenshot was saved.", 422);
 
+    const probe = await page.evaluate(() => {
+      const visible = !!document.body && (document.body.innerText.trim().length > 0 || document.images.length > 0 || !!document.querySelector("canvas,video,svg"));
+      let darkAware = !!document.querySelector('meta[name="color-scheme"]');
+      const root = document.documentElement;
+      if (/dark/i.test(`${root.className} ${root.getAttribute("data-theme")} ${root.getAttribute("data-bs-theme")} ${root.style.colorScheme}`)) darkAware = true;
+      const scan = (rules: CSSRuleList): boolean => Array.from(rules).some((r) => {
+        const m = (r as CSSMediaRule).media?.mediaText ?? "";
+        return /prefers-color-scheme/.test(m) || ("cssRules" in r && scan((r as CSSGroupingRule).cssRules));
+      });
+      for (const ss of Array.from(document.styleSheets)) {
+        try { if (scan(ss.cssRules)) { darkAware = true; break; } } catch { darkAware = true; break; } // cross-origin sheet: can't tell
+      }
+      return { visible, darkAware };
+    }).catch(() => ({ visible: true, darkAware: true }));
+    if (!probe.visible) notes.push("The page rendered almost no visible content. It may need JavaScript that was blocked, require a sign-in or reject automated browsers.");
+    if (o.colorScheme === "dark" && !probe.darkAware) notes.push("This site doesn't appear to define a dark theme, so Dark mode may have no effect. Sites that only offer a manual theme toggle can't be switched automatically.");
+
     let png: Buffer;
+    let pageHeight: number | null = null;
     const shotTimeout = Math.max(5000, left() - 3000);
     if (o.mode === "full") {
       const pageH = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0));
-      const cap = Math.floor(Math.min(LIMITS.maxBitmapSide / o.scale, LIMITS.maxPixels / (o.width * o.scale * o.scale)));
-      const h = Math.max(o.height, Math.min(pageH, cap));
-      if (pageH > cap) notes.push(`The page is ${pageH.toLocaleString()}px tall; the capture was limited to the first ${cap.toLocaleString()}px.`);
-      png = await page.screenshot({ type: "png", fullPage: true, clip: { x: 0, y: 0, width: o.width, height: h }, omitBackground: o.transparent, animations: "disabled", timeout: shotTimeout });
+      pageHeight = pageH;
+      const cap = Math.floor(Math.min(LIMITS.maxBitmapSide / eff, LIMITS.maxPixels / (vw * eff * eff)));
+      const h = Math.max(vh, Math.min(pageH, cap));
+      if (pageH > cap) notes.push(`This page is ${pageH.toLocaleString()} CSS px tall. Only the first ${cap.toLocaleString()} px fit within the size limit. Use a lower scale factor, a smaller zoom or capture it in Viewport mode for a specific section.`);
+      png = await page.screenshot({ type: "png", fullPage: true, clip: { x: 0, y: 0, width: vw, height: h }, omitBackground: o.transparent, animations: "disabled", timeout: shotTimeout });
     } else {
-      if (o.width * o.height * o.scale * o.scale > LIMITS.maxPixels) throw new CaptureError("MEMORY", "That resolution and scale factor is too large. Lower the scale factor.", 413);
+      if (vw * vh * eff * eff > LIMITS.maxPixels) throw new CaptureError("MEMORY", "That resolution and scale factor is too large. Lower the scale factor.", 413);
       png = await page.screenshot({ type: "png", omitBackground: o.transparent, animations: "disabled", timeout: shotTimeout });
+      const wantH = o.height * o.scale;
+      if (png.readUInt32BE(20) > wantH) png = await sharp(png).extract({ left: 0, top: 0, width: Math.min(png.readUInt32BE(16), o.width * o.scale), height: wantH }).png().toBuffer();
     }
     if (o.transparent && o.format !== "png") notes.push("Transparent backgrounds are only supported in PNG; JPEG uses white and WebP keeps transparency.");
 
     const width = png.readUInt32BE(16), height = png.readUInt32BE(20);
     const { buf, type } = await encode(png, o.format, o.quality, notes);
-    return { buffer: buf, contentType: type, width, height, notes, ms: Date.now() - t0 };
+    const title = (await page.title().catch(() => "")).slice(0, 200);
+    return { buffer: buf, contentType: type, width, height, notes, ms: Date.now() - t0, finalUrl: page.url(), title, status, pageHeight };
   } catch (e) {
     if (signal?.aborted) throw new CaptureError("UNKNOWN", "Capture cancelled.", 499);
     const ce = mapError(e);

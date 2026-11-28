@@ -1,4 +1,4 @@
-# WSNAP — Website Screenshot Studio
+# WSNAP - Website Screenshot Studio
 
 Capture full-page or viewport screenshots of any public website at exact resolutions, rendered by a real Chromium browser. Export PNG, JPEG or WebP. No paid APIs, no keys, no database.
 
@@ -69,9 +69,35 @@ None are required in production. `CHROME_PATH` is optional and local-only.
 - **Workflow:** batch mode (≤5 URLs), multi-size capture (extra Desktop/Tablet/Mobile, ≤10 captures per run, run one after another), saved + recently used configurations, reset, drag-and-drop import of PNG/JPEG/WebP, keyboard shortcuts (see Settings).
 - **Not implemented:** manual scroll-and-stitch capture. Chromium's native full-page capture is used, capped at ~16,000 px / 50 MP and truncation is reported. Stitching would add memory use and seam artifacts on sticky-header sites and was not worth the risk on a 1 GB function.
 
+## Capture accuracy notes
+
+- **Color scheme:** Auto emulates your device's light/dark preference (Playwright alone always reports "light"), Light/Dark force it. It is set on the browser context, so it is active before the page parses. Sites that only offer a manual theme toggle cannot be switched this way and WSNAP says so for Dark mode when no dark theme is detected. No CSS filters are used.
+- **Browser zoom:** emulated the way Chromium implements zoom: CSS viewport = width / zoom and pixel ratio = scale x zoom. Media queries see the zoomed width and the output stays exactly width x scale pixels. Zoom, viewport size and device scale factor are independent settings. This is page-scale emulation, not the browser UI's own zoom control.
+- **Job counting:** `lib/jobs.ts` (`planJobs`) is the single source of truth for the button label, the summary and the capture run.
+
 ## Testing
 
+`npm run test:all` runs everything. `npm test` (logic, no browser), `npm run test:engine` (real Chromium engine against local pages) and `npm run test:ui` (the real UI bundled with the app's Tailwind CSS, driven in Chromium; only `/api/capture` is intercepted). The last two need Chromium (`npm run setup:browser` or `CHROME_PATH`) and `esbuild` (a dev dependency). The test builds stub the SSRF/port checks in a temporary copy only; production code is unchanged. These tests do not replace `next build` or a real Vercel deployment.
+
+## Testing (basic)
+
 `npm test` runs 7 pure-logic tests (URL validation, obfuscated-IP normalization, private/metadata/IPv6 range blocking, option clamping, filenames). See the summary delivered with Step 2 for exactly what was and was not verified in a real browser.
+
+## Capture settings: colour scheme, browser zoom, job planning
+
+- **Website color scheme** (Auto / Light / Dark) is applied with Playwright's `colorScheme` context option, so it is in effect before the page is parsed, in both Full page and Viewport mode. Auto emulates *your* device's light/dark preference (Playwright would otherwise always report "light"); Light/Dark force `prefers-color-scheme`. No CSS filters or injected dark CSS. Sites that only offer a manual theme toggle cannot be switched automatically; WSNAP warns when Dark is requested and the site doesn't appear to define a dark theme.
+- **Browser zoom** (25-300%, presets 50-200%) is emulated the way Chromium implements zoom: CSS viewport = width / zoom and pixel ratio = scale x zoom. Media queries see the zoomed width, so responsive layouts react as in a real browser. **Viewport size, browser zoom and device scale factor are separate**: output is always width x scale pixels wide (viewport captures are cropped losslessly to exactly height x scale).
+- **One job planner** (`lib/jobs.ts`) decides what will be captured: unique normalized URLs x unique sizes. The Generate button, the summary line and the capture loop all use it and settings changes never add jobs; only the explicit "Additional sizes" chips and batch URLs do.
+
+## Tests
+
+```bash
+npm test              # pure logic: validation, SSRF ranges, job planner, zoom geometry
+npm run test:engine   # real Chromium + sharp against local pages (needs a browser, see below)
+npm run test:ui       # bundles the real UI, drives it in Chromium; also covers responsive layouts
+npm run test:all
+```
+`test:engine` and `test:ui` need a Chromium (`npm run setup:browser` or set `CHROME_PATH`). In their temporary build copy only, the private-network and port checks are stubbed so the engine can reach a local test server; production code is not modified.
 
 ## Free-tier limitations (please read)
 

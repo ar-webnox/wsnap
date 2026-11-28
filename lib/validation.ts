@@ -54,6 +54,9 @@ export function parseOptions(body: unknown): { ok: true; value: CaptureOptions }
       hideCookieBanners: b.hideCookieBanners !== false,
       transparent: b.transparent === true,
       fixed: pick(b.fixed, ["keep", "static", "hide"], "keep"),
+      colorScheme: pick(b.colorScheme, ["auto", "light", "dark"], "auto"),
+      systemScheme: b.systemScheme === "dark" ? "dark" : b.systemScheme === "light" ? "light" : undefined,
+      zoom: num(b.zoom, LIMITS.minZoom, LIMITS.maxZoom, 100),
     },
   };
 }
